@@ -1,0 +1,9 @@
+{
+  "files": [
+    {"id": "sheet-prop-id", "name": "properties"},
+    {"id": "sheet-ten-id", "name": "tenants"},
+    {"id": "sheet-ven-id", "name": "vendors"},
+    {"id": "sheet-mnt-id", "name": "maintenance"},
+    {"id": "sheet-evt-id", "name": "events"}
+  ]
+}
