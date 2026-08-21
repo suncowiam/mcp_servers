@@ -144,3 +144,50 @@ def update_row(
         if _is_rate_limit(exc):
             raise APIRateLimitError(f"Drive rate limit hit updating {csv_name}") from exc
         raise
+
+
+def update_rows(
+    sheet_id: str,
+    csv_name: str,
+    row_indices: list[int],
+    values: dict[str, str],
+    *,
+    credentials_path: str | None = None,
+) -> None:
+    """Apply the same `values` to multiple rows in a single Sheets API call.
+
+    `row_indices` is a list of 1-indexed Sheet row numbers. Same semantics as
+    `update_row` — only columns in `values` are touched. All rows are updated
+    in a single batchUpdate HTTP request, so cost is constant regardless of
+    row count.
+    """
+    from pm_manage_csvs.drive import get_sheets_service
+
+    if csv_name not in SCHEMAS:
+        raise ValueError(f"unknown csv_name: {csv_name}")
+    if not row_indices:
+        raise ValueError("row_indices must be non-empty")
+    if not values:
+        raise ValueError("values must be non-empty")
+
+    schema = SCHEMAS[csv_name]
+    svc = get_sheets_service(credentials_path)
+    updates = []
+    for row_index in row_indices:
+        for header, value in values.items():
+            col = schema.get_column(header)
+            rng = f"{col.col_letter}{row_index}"
+            updates.append({"range": rng, "values": [[value]]})
+
+    body = {"valueInputOption": "USER_ENTERED", "data": updates}
+    try:
+        (
+            svc.spreadsheets()
+            .values()
+            .batchUpdate(spreadsheetId=sheet_id, body=body)
+            .execute()
+        )
+    except HttpError as exc:
+        if _is_rate_limit(exc):
+            raise APIRateLimitError(f"Drive rate limit hit updating {csv_name}") from exc
+        raise

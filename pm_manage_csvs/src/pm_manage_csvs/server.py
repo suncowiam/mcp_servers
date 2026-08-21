@@ -38,6 +38,7 @@ from pm_manage_csvs.schema import (
 from pm_manage_csvs.sheets import append_rows as sheets_append_rows
 from pm_manage_csvs.sheets import read_sheet
 from pm_manage_csvs.sheets import update_row as sheets_update_row
+from pm_manage_csvs.sheets import update_rows as sheets_update_rows
 
 mcp = FastMCP("pm_manage_csvs")
 _log = get_logger("pm_manage_csvs.server")
@@ -183,15 +184,22 @@ def list_open_maintenance(
     owner: str | None = None,
     property: str | None = None,
 ) -> list[str]:
-    """Return open maintenance items as compact grouped text lines.
+    """Return open maintenance items, grouped by owner with global numbering.
 
-    Token-optimized alternative to read_csv_rows for the common
-    "what are the open maintenance items?" query. Roughly 70% fewer
-    chars than the JSON path for the same data.
+    Format:
+        <owner>:
+        N. Property [Unit] — Issue (Nd, row=R)        ← one per open item
 
-    Each line: "[owner] Property [Unit] - Issue (since YYYY-MM-DD, Nd ago)"
-    Grouped by owner (tuan, chris, sharon, vendor), oldest-first within group.
-    Empty list if no matches.
+        <owner>:
+        ...
+
+        Notes: #N is today, #M is overdue              ← only if applicable
+
+    - N: display index, 1-indexed, global across owner groups
+    - row=R: Sheet row for update_row("maintenance", R, {...})
+    - "(today)" or "(Nd)": age marker; "(today)" highlights critical items
+    - Filters re-enumerate (#1 = oldest matching item)
+    - Always re-list before any update — statuses change.
 
     Args:
         owner: optional filter (case-insensitive) - "tuan" | "chris" | "sharon" | "vendor"
@@ -202,14 +210,21 @@ def list_open_maintenance(
         folder_id, "maintenance", filename_override=_get_filename_override("maintenance")
     )
     rows = read_sheet(sheet_id, "maintenance")
-    open_rows = [r for r in rows if r.get("status", "").strip().lower() == "open"]
+
+    # Pair each row with its 1-indexed Sheet row (header is row 1, data starts at 2)
+    all_indexed = [(i, r) for i, r in enumerate(rows, start=2)]
+    open_indexed = [(i, r) for i, r in all_indexed if r.get("status", "").strip().lower() == "open"]
     if owner:
-        open_rows = [
-            r for r in open_rows if r.get("owner", "").strip().lower() == owner.strip().lower()
+        open_indexed = [
+            (i, r)
+            for i, r in open_indexed
+            if r.get("owner", "").strip().lower() == owner.strip().lower()
         ]
     if property:
-        open_rows = [
-            r for r in open_rows if r.get("property", "").strip() == property.strip()
+        open_indexed = [
+            (i, r)
+            for i, r in open_indexed
+            if r.get("property", "").strip() == property.strip()
         ]
 
     today = date.today()
@@ -220,26 +235,51 @@ def list_open_maintenance(
         except (ValueError, TypeError):
             return 0
 
-    def _format_row(r: dict[str, str]) -> str:
-        owner_v = r.get("owner", "?")
+    owner_order = {"tuan": 0, "chris": 1, "sharon": 2, "vendor": 3}
+    open_indexed.sort(
+        key=lambda pair: (
+            owner_order.get(pair[1].get("owner", ""), 99),
+            pair[1].get("start_date", "9999-99-99"),
+        )
+    )
+
+    def _format_item(n: int, sheet_row: int, r: dict[str, str]) -> str:
         prop = r.get("property", "?")
         unit = r.get("unit", "")
         issue = r.get("issue", "")
         start = r.get("start_date", "")
-        age = f" (since {start}, {_days(start)}d)" if start else ""
-        unit_str = f" {unit}" if unit else ""
-        return f"[{owner_v}] {prop}{unit_str} - {issue}{age}"
+        days = _days(start)
+        age_marker = "today" if days == 0 and start else f"{days}d"
+        unit_str = f", {unit}" if unit else ""
+        return f"{n}. {prop}{unit_str} — {issue} ({age_marker}, row={sheet_row})"
 
-    owner_order = {"tuan": 0, "chris": 1, "sharon": 2, "vendor": 3}
-    open_rows.sort(
-        key=lambda r: (
-            owner_order.get(r.get("owner", ""), 99),
-            r.get("start_date", "9999-99-99"),
-        )
+    lines: list[str] = []
+    today_numbers: list[int] = []
+    current_owner: str | None = None
+    for n, (sheet_row, r) in enumerate(open_indexed, start=1):
+        owner_v = r.get("owner", "?")
+        if owner_v != current_owner:
+            current_owner = owner_v
+            lines.append(f"{owner_v}:")
+        lines.append(_format_item(n, sheet_row, r))
+        if r.get("start_date", "") == today.strftime("%Y-%m-%d"):
+            today_numbers.append(n)
+
+    if today_numbers:
+        lines.append("")
+        if len(today_numbers) == 1:
+            lines.append(f"Notes: #{today_numbers[0]} is today")
+        else:
+            nums = ", #".join(str(x) for x in today_numbers)
+            lines.append(f"Notes: #{nums} are today")
+
+    _log.info(
+        "list_open_maintenance",
+        count=len(open_indexed),
+        owner=owner,
+        property=property,
+        today_count=len(today_numbers),
     )
-
-    lines = [_format_row(r) for r in open_rows]
-    _log.info("list_open_maintenance", count=len(lines), owner=owner, property=property)
     return lines
 
 
@@ -289,6 +329,61 @@ def update_row(csv_name: str, row_index: int, values: dict[str, str]) -> dict[st
     sheets_update_row(sheet_id, csv_name, row_index, coerced)
     _log.info("update_row", csv=csv_name, row=row_index, fields=sorted(coerced.keys()))
     return {"ok": True, "row": row_index, "updated_fields": sorted(coerced.keys())}
+
+
+@mcp.tool()
+@_envelope("update_rows")
+def update_rows(
+    csv_name: str,
+    row_indices: list[int],
+    values: dict[str, str],
+) -> dict[str, Any]:
+    """Apply the same `values` to multiple rows in one Sheets API call.
+
+    Token-efficient bulk update: 1 tool call instead of N. Use when you need
+    to update several rows with the same field values (e.g. "mark all chris's
+    open tasks as done").
+
+    Refuses to overwrite primary-key columns. Auto-fills `completed_at` on
+    maintenance when status flips to 'done'.
+
+    Args:
+        csv_name: target sheet (e.g. "maintenance")
+        row_indices: 1-indexed Sheet row numbers, e.g. [3, 5, 7]
+        values: field→value map, e.g. {"status": "done"}
+    """
+    schema = _get_schema_obj(csv_name)
+    if not row_indices:
+        raise PMCError("row_indices must be non-empty")
+    if not values:
+        raise PMCError("values must be non-empty")
+    forbidden = set(schema.primary_key)
+    bad = forbidden & set(values.keys())
+    if bad:
+        raise PMCError(f"cannot update primary-key columns: {sorted(bad)}")
+
+    # Coerce values once, then apply to all rows
+    coerced: dict[str, str] = {}
+    for header, value in values.items():
+        col = schema.get_column(header)
+        coerced[header] = col.coerce(value)
+    coerced_dict = apply_auto_fills(csv_name, [coerced], is_update=True)[0]
+    coerced = {k: v for k, v in coerced_dict.items() if k in coerced or k == "completed_at"}
+
+    folder_id = _get_folder_id()
+    sheet_id = resolve_sheet_id(folder_id, csv_name, filename_override=_get_filename_override(csv_name))
+    sheets_update_rows(sheet_id, csv_name, row_indices, coerced)
+    _log.info(
+        "update_rows",
+        csv=csv_name,
+        row_count=len(row_indices),
+        fields=sorted(coerced.keys()),
+    )
+    return {
+        "ok": True,
+        "rows_updated": list(row_indices),
+        "values_applied": coerced,
+    }
 
 
 # ── Startup ───────────────────────────────────────────────────────────────

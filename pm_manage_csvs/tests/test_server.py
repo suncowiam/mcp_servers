@@ -105,14 +105,21 @@ def test_list_open_maintenance_groups_by_owner_and_ages(
     from pm_manage_csvs.server import list_open_maintenance
 
     lines = list_open_maintenance.__wrapped__()
-    # 2 open rows, 1 done (filtered out)
-    assert len(lines) == 2
-    # owner_order: tuan < chris < sharon < vendor → tuan first
-    assert lines[0].startswith("[tuan]")
-    assert lines[1].startswith("[chris]")
+    # 2 open rows, 1 done (filtered out) → 3 lines: "tuan:", "1. ...", "chris:", "2. ..."
+    # Wait — only 2 open rows, so we expect 4 lines: "tuan:" + 1 item + "chris:" + 1 item
+    assert len(lines) == 4
+    # Owner headers
+    assert lines[0] == "tuan:"
+    assert lines[2] == "chris:"
+    # Globally numbered items
+    assert lines[1].startswith("1. ")
+    assert lines[3].startswith("2. ")
+    # Each item carries (row=R) action key
+    assert "row=" in lines[1]
+    assert "row=" in lines[3]
     # Age shown in days
-    assert "since 2026-06-26" in lines[1]
-    assert "since 2026-08-07" in lines[0]
+    assert "14d" in lines[1]
+    assert "56d" in lines[3]
 
 
 def test_list_open_maintenance_filter_by_owner(
@@ -121,8 +128,11 @@ def test_list_open_maintenance_filter_by_owner(
     from pm_manage_csvs.server import list_open_maintenance
 
     lines = list_open_maintenance.__wrapped__(owner="chris")
-    assert len(lines) == 1
-    assert "[chris]" in lines[0]
+    # chris filter → only 1 item → 2 lines: "chris:" + item
+    assert len(lines) == 2
+    assert lines[0] == "chris:"
+    # Filter resets enumeration: only one chris row → it's #1
+    assert lines[1].startswith("1. ")
 
 
 def test_list_open_maintenance_empty_when_no_match(
@@ -139,8 +149,6 @@ def test_list_open_maintenance_includes_unit_when_present(
 ) -> None:
     """If a row has a unit, it should appear in the line."""
     from pm_manage_csvs.server import list_open_maintenance
-
-    # Override fake to return one row with a unit
     from tests.conftest import _FakeSheetsService
 
     new_data = {
@@ -164,20 +172,21 @@ def test_list_open_maintenance_includes_unit_when_present(
     import pm_manage_csvs.drive
 
     monkeypatch.setattr(pm_manage_csvs.drive, "build", factory)
-    # Clear cached sheet_id so it re-resolves
     from pm_manage_csvs.cache import get_sheet_id_cache
 
     get_sheet_id_cache().clear()
 
     lines = list_open_maintenance.__wrapped__()
-    assert len(lines) == 1
-    assert "Unit 9" in lines[0] or " 9" in lines[0]
+    # 1 item → 2 lines: "chris:" + item
+    assert len(lines) == 2
+    # Unit is formatted as ", 9" in the property string
+    assert ", 9" in lines[1]
 
 
 def test_list_open_maintenance_handles_missing_start_date(
     fake_drive_service_with_maintenance, monkeypatch
 ) -> None:
-    """Rows without start_date should still appear but without the age suffix."""
+    """Rows without start_date should still appear but without days marker."""
     import json
     from pathlib import Path
 
@@ -200,10 +209,134 @@ def test_list_open_maintenance_handles_missing_start_date(
     get_sheet_id_cache().clear()
 
     lines = list_open_maintenance.__wrapped__()
-    assert len(lines) == 1
-    # No "since" or "d ago" when start_date is empty
-    assert "since" not in lines[0]
-    assert "d ago" not in lines[0]
+    assert len(lines) == 2  # "chris:" + item
+    # Item is rendered but age marker is missing (no Nd, no "today")
+    assert "today" not in lines[1]
+    assert "d)" not in lines[1]
+    # row=R is still present
+    assert "row=" in lines[1]
+
+
+def test_list_open_maintenance_includes_row_action_key(
+    fake_drive_service_with_maintenance, fake_maintenance_data
+) -> None:
+    """Each item line carries (row=R) for update_row translation."""
+    import re
+
+    from pm_manage_csvs.server import list_open_maintenance
+
+    lines = list_open_maintenance.__wrapped__()
+    # Skip owner header lines (which have no row=)
+    item_lines = [line for line in lines if line.startswith(("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9."))]
+    rows = [int(re.search(r"row=(\d+)", line).group(1)) for line in item_lines]
+    # Data rows start at row 2 (after header)
+    assert all(r >= 2 for r in rows)
+    # 2 open rows → 2 distinct row indices
+    assert len(set(rows)) == 2
+
+
+def test_list_open_maintenance_global_enumeration_across_owners(
+    fake_drive_service_with_maintenance, monkeypatch
+) -> None:
+    """#N is global across owner groups, not reset per group."""
+    import json
+    from pathlib import Path
+
+    from pm_manage_csvs.server import list_open_maintenance
+    from tests.conftest import _FakeDriveService, _FakeSheetsService
+
+    # 3 chris + 2 tuan (5 total). After sort: 2 tuan first, then 3 chris.
+    # #1, #2 = tuan; #3, #4, #5 = chris.
+    multi = {
+        "values": [
+            ["A St", "", "tuan", "2026-04-01", "", "T1", "open", "", ""],
+            ["B St", "", "chris", "2026-04-02", "", "C1", "open", "", ""],
+            ["C St", "", "tuan", "2026-04-03", "", "T2", "open", "", ""],
+            ["D St", "", "chris", "2026-04-04", "", "C2", "open", "", ""],
+            ["E St", "", "chris", "2026-04-05", "", "C3", "open", "", ""],
+        ]
+    }
+
+    def factory(service_name, *_args, **_kwargs):
+        if service_name == "sheets":
+            return _FakeSheetsService(default_response={}, by_id={"sheet-mnt-id": multi})
+        return _FakeDriveService(
+            json.loads((Path(__file__).parent / "fixtures" / "sample_folder.json").read_text())
+        )
+
+    import pm_manage_csvs.drive
+    from pm_manage_csvs.cache import get_sheet_id_cache
+
+    monkeypatch.setattr(pm_manage_csvs.drive, "build", factory)
+    get_sheet_id_cache().clear()
+
+    lines = list_open_maintenance.__wrapped__()
+    # 5 items + 2 owner headers = 7 lines (no Notes section since no today items)
+    item_lines = [line for line in lines if line[0].isdigit()]
+    assert len(item_lines) == 5
+    # #1 and #2 are tuan; #3, #4, #5 are chris
+    assert item_lines[0].startswith("1. A St")
+    assert item_lines[1].startswith("2. C St")  # T2 is later
+    assert item_lines[2].startswith("3. B St")
+    assert item_lines[3].startswith("4. D St")
+    assert item_lines[4].startswith("5. E St")
+
+
+def test_list_open_maintenance_translation_round_trip(
+    fake_drive_service_with_maintenance, fake_maintenance_data
+) -> None:
+    """Parse N → row=R → update_row(R, ...) should work end-to-end."""
+    import re
+
+    from pm_manage_csvs.server import list_open_maintenance, update_row
+
+    lines = list_open_maintenance.__wrapped__()
+    # #2 is the second item; find it (chris's row in fake_maintenance_data)
+    target = next(line for line in lines if line.startswith("2. "))
+    row = int(re.search(r"row=(\d+)", target).group(1))
+
+    result = update_row.__wrapped__("maintenance", row, {"status": "done"})
+    assert result["ok"] is True
+
+
+def test_list_open_maintenance_notes_section_for_today_items(
+    fake_drive_service_with_maintenance, monkeypatch
+) -> None:
+    """If any open item has start_date == today, append a Notes section."""
+    import json
+    from datetime import date as _date
+    from pathlib import Path
+
+    from pm_manage_csvs.server import list_open_maintenance
+    from tests.conftest import _FakeDriveService, _FakeSheetsService
+
+    today = _date.today().isoformat()
+    with_today = {
+        "values": [
+            ["Past St", "", "tuan", "2026-04-01", "", "Past issue", "open", "", ""],
+            ["Today St", "", "chris", today, "", "Today issue", "open", "", ""],
+        ]
+    }
+
+    def factory(service_name, *_args, **_kwargs):
+        if service_name == "sheets":
+            return _FakeSheetsService(default_response={}, by_id={"sheet-mnt-id": with_today})
+        return _FakeDriveService(
+            json.loads((Path(__file__).parent / "fixtures" / "sample_folder.json").read_text())
+        )
+
+    import pm_manage_csvs.drive
+    from pm_manage_csvs.cache import get_sheet_id_cache
+
+    monkeypatch.setattr(pm_manage_csvs.drive, "build", factory)
+    get_sheet_id_cache().clear()
+
+    lines = list_open_maintenance.__wrapped__()
+    # 2 items + 2 owner headers + blank + Notes = 6 lines
+    assert lines[-1] == "Notes: #2 is today"
+    assert lines[-2] == ""  # blank line between items and Notes
+    # the second item line uses "(today," not "(14d,"
+    assert "today" in lines[-3]
 
 
 def test_append_rows_rejects_bad_enum(fake_drive_service, fake_sheets_service) -> None:
@@ -269,3 +402,42 @@ def test_missing_folder_id_returns_error(tmp_path, monkeypatch) -> None:
     result = server.read_csv("properties")
     assert isinstance(result, dict)
     assert result["error"] == "PMCError"
+
+
+def test_update_rows_marks_multiple_done(fake_drive_service, fake_sheets_service) -> None:
+    """Bulk update: 1 call marks N rows."""
+    from pm_manage_csvs.server import update_rows
+
+    result = update_rows("maintenance", [3, 5, 7], {"status": "done"})
+    assert isinstance(result, dict)
+    assert result["ok"] is True
+    assert result["rows_updated"] == [3, 5, 7]
+    assert result["values_applied"]["status"] == "done"
+
+
+def test_update_rows_empty_row_indices_rejected(fake_drive_service, fake_sheets_service) -> None:
+    """Empty list is an error, not a silent no-op."""
+    from pm_manage_csvs.server import update_rows
+
+    result = update_rows("maintenance", [], {"status": "done"})
+    assert isinstance(result, dict)
+    assert result["error"] == "PMCError"
+    assert "non-empty" in result["detail"]
+
+
+def test_update_rows_blocks_primary_key(fake_drive_service, fake_sheets_service) -> None:
+    """Same protection as update_row."""
+    from pm_manage_csvs.server import update_rows
+
+    result = update_rows("tenants", [1, 2], {"property": "new addr"})
+    assert isinstance(result, dict)
+    assert "primary-key columns" in result["detail"]
+
+
+def test_update_rows_auto_fills_completed_at(fake_drive_service, fake_sheets_service) -> None:
+    """Same auto-fill behavior as update_row — status='done' sets completed_at."""
+    from pm_manage_csvs.server import update_rows
+
+    result = update_rows("maintenance", [2, 4, 6], {"status": "done"})
+    assert result["ok"] is True
+    assert "completed_at" in result["values_applied"]
