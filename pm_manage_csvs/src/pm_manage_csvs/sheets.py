@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from googleapiclient.errors import HttpError
 
 from pm_manage_csvs.errors import APIRateLimitError
@@ -59,6 +61,14 @@ def append_rows(
     """Append `rows` to the Sheet, returning the 1-indexed row numbers of appended rows.
 
     Each row in `rows` must already be aligned to the schema columns.
+
+    Both single-row and multi-row appends go through the same path:
+    `_find_first_free_row` walks column A to locate the end of the contiguous
+    data block, then `values().update()` writes all rows starting at the
+    first free row in one call. This is deliberately NOT `values().append()`:
+    that endpoint's table-boundary detection is a black box and has known edge
+    cases — silent single-row drops (logs/08-25-26/BUG-mcp-append-single-row.md)
+    and polluted-tail misplacement (logs/09-08-26/BUG-row1002-contiguous-block.md).
     """
     from pm_manage_csvs.drive import get_sheets_service
 
@@ -67,18 +77,22 @@ def append_rows(
     schema = SCHEMAS[csv_name]
     last_col = schema.columns[-1].col_letter
 
-    svc = get_sheets_service(credentials_path)
-    rng = f"A:{last_col}"
+    if not rows:
+        return []
 
+    svc = get_sheets_service(credentials_path)
+
+    target_row = _find_first_free_row(svc, sheet_id, csv_name)
+    end_row = target_row + len(rows) - 1
+    rng = f"A{target_row}:{last_col}{end_row}"
     try:
-        resp = (
+        (
             svc.spreadsheets()
             .values()
-            .append(
+            .update(
                 spreadsheetId=sheet_id,
                 range=rng,
                 valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
                 body={"values": rows},
             )
             .execute()
@@ -88,19 +102,49 @@ def append_rows(
             raise APIRateLimitError(f"Drive rate limit hit appending to {csv_name}") from exc
         raise
 
-    # Parse "updates" to find row numbers; API returns updatedRange like "Sheet1!A5:J5"
-    updated_range = resp.get("updates", {}).get("updatedRange", "")
-    rows_added: list[int] = []
-    if "!" in updated_range and ":" in updated_range:
-        # Extract first row number from the range
-        # e.g. "Sheet1!A5:J7" → 5
-        cell_ref = updated_range.split("!", 1)[1]
-        first_cell = cell_ref.split(":", 1)[0]
-        digits = "".join(c for c in first_cell if c.isdigit())
-        if digits:
-            start_row = int(digits)
-            rows_added = list(range(start_row, start_row + len(rows)))
-    return rows_added
+    return list(range(target_row, end_row + 1))
+
+
+def _find_first_free_row(svc: Any, sheet_id: str, csv_name: str) -> int:
+    """Return the first empty row after the schema header (row 1).
+
+    Walks column A and breaks at the first empty cell. Critically, this
+    finds the END OF THE CONTIGUOUS DATA BLOCK, not the last filled row in
+    the read window — if the sheet has stray data past an empty gap (e.g.
+    orphan rows from a prior shift), `last_filled+1` would skip past the
+    gap and place new rows far from the real data table.
+
+    Real-world hit (2026-09-08): orphan rows at 1000/1001 in the maintenance
+    sheet caused the next append to land at row 1002 instead of row 56.
+    """
+    try:
+        col_a_resp = (
+            svc.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=sheet_id,
+                range="A:A",
+                valueRenderOption="UNFORMATTED_VALUE",
+            )
+            .execute()
+        )
+    except HttpError as exc:
+        if _is_rate_limit(exc):
+            raise APIRateLimitError(
+                f"Drive rate limit hit reading {csv_name} for append"
+            ) from exc
+        raise
+
+    # Row 1 is always the schema header; never write the data row on top of it.
+    last_in_block = 1
+    for i, cell in enumerate(col_a_resp.get("values", []), start=1):
+        if i < 2:
+            continue  # header row — skip without breaking
+        if cell and any(str(c).strip() for c in cell):
+            last_in_block = i
+        else:
+            break  # first gap after the header ends the contiguous block
+    return max(last_in_block + 1, 2)
 
 
 def update_row(

@@ -67,30 +67,23 @@ class _FakeValuesGetRequest:
         return self._response
 
 
-class _FakeValuesAppendRequest:
-    def __init__(self, body: dict[str, Any]) -> None:
-        self._body = body
-        self._counter = 100  # pretend sheet has 100 rows; appended will start at 101
-
-    def execute(self) -> dict[str, Any]:
-        n = len(self._body.get("values", []))
-        start = self._counter + 1
-        self._counter += n
-        end_col = max(len(r) for r in self._body.get("values", [])) if n else 0
-        col_letter = chr(ord("A") + end_col - 1) if end_col else "A"
-        return {
-            "updates": {
-                "updatedRange": f"Sheet1!A{start}:{col_letter}{self._counter}",
-            }
-        }
-
-
 class _FakeBatchUpdateRequest:
     def __init__(self, body: dict[str, Any]) -> None:
         self._body = body
 
     def execute(self) -> dict[str, Any]:
         return {"replies": [{"updatedRange": "x"}] * len(self._body.get("data", []))}
+
+
+class _FakeValuesUpdateRequest:
+    """Fake for values().update() — echoes the requested range so tests can
+    assert on the target row that was written."""
+
+    def __init__(self, rng: str | None) -> None:
+        self._range = rng or ""
+
+    def execute(self) -> dict[str, Any]:
+        return {"updatedRange": self._range}
 
 
 class _FakeValues:
@@ -109,8 +102,8 @@ class _FakeValues:
         response = self._by_id.get(sid, self._default)
         return _FakeValuesGetRequest(response)
 
-    def append(self, **_kwargs: Any) -> _FakeValuesAppendRequest:
-        return _FakeValuesAppendRequest(_kwargs.get("body", {}))
+    def update(self, **_kwargs: Any) -> _FakeValuesUpdateRequest:
+        return _FakeValuesUpdateRequest(_kwargs.get("range"))
 
     def batchUpdate(self, **_kwargs: Any) -> _FakeBatchUpdateRequest:
         return _FakeBatchUpdateRequest(_kwargs.get("body", {}))
@@ -154,15 +147,20 @@ def fake_sheet_data() -> dict[str, Any]:
 
 @pytest.fixture
 def fake_maintenance_data() -> dict[str, Any]:
-    """Sample maintenance data: 2 open + 1 done for filter tests."""
+    """Sample maintenance data with today-relative dates (so tests are stable as time moves)."""
+    from datetime import date, timedelta
+
+    today = date.today()
     return {
         "values": [
-            # open, chris, oldest
-            ["2423 Boxwood St", "", "chris", "2026-06-26", "", "Repair gutter", "open", "", ""],
-            # open, tuan, recent
-            ["2755 Oakmont St", "", "tuan", "2026-08-07", "", "Call vendor", "open", "", ""],
-            # done, chris
-            ["2807 Pixie Dr", "", "chris", "2026-04-28", "", "Electrical outlet", "done", "", "2026-04-30"],
+            # open, chris, 14d old
+            ["2423 Boxwood St", "", "chris", (today - timedelta(days=14)).isoformat(), "", "Repair gutter", "open", "", ""],
+            # open, tuan, 4d old
+            ["2755 Oakmont St", "", "tuan", (today - timedelta(days=4)).isoformat(), "", "Call vendor", "open", "", ""],
+            # done, chris, 30d old (within default window so tests that expect this row need to check)
+            ["2807 Pixie Dr", "", "chris", (today - timedelta(days=30)).isoformat(), "", "Electrical outlet", "done", "", (today - timedelta(days=29)).isoformat()],
+            # open, chris, 56d old (OUTSIDE default 30d window — excluded by default)
+            ["1800 Old St", "", "chris", (today - timedelta(days=56)).isoformat(), "", "Old item", "open", "", ""],
         ]
     }
 

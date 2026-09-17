@@ -189,10 +189,43 @@ SCHEMAS: dict[str, Schema] = {
 }
 
 
+# Maps each CSV to the column used to filter rows by recency in read tools.
+# None = this CSV has no date column / doesn't grow unboundedly; read everything.
+ENTRY_DATE_COLUMN: dict[str, str | None] = {
+    "properties": None,
+    "tenants": None,
+    "vendors": None,
+    "maintenance": "start_date",
+    "events": "date",
+}
+
+
 def get_schema(name: str) -> Schema:
     if name not in SCHEMAS:
         raise ValidationError(name, f"unknown csv_name (valid: {sorted(SCHEMAS)})")
     return SCHEMAS[name]
+
+
+def _within_entry_date(row: dict[str, str], schema: Schema, days: int, today: date) -> bool:
+    """True if the row's entry date is within the last `days`.
+
+    - days <= 0: no filter (always True)
+    - schema has no entry-date column: no filter (always True)
+    - row's date is empty or unparseable: include (don't silently hide data)
+    """
+    if days <= 0:
+        return True
+    col_name = ENTRY_DATE_COLUMN.get(schema.name)
+    if col_name is None:
+        return True
+    v = row.get(col_name, "").strip()
+    if not v:
+        return True
+    try:
+        d = datetime.strptime(v, ISO_DATE).date()
+    except ValueError:
+        return True
+    return (today - d).days <= days
 
 
 def row_to_list(schema: Schema, row: dict[str, Any]) -> list[str]:

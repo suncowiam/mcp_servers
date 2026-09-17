@@ -28,6 +28,7 @@ from pm_manage_csvs.errors import PMCError
 from pm_manage_csvs.logging import configure_logging, get_logger
 from pm_manage_csvs.schema import (
     SCHEMAS,
+    _within_entry_date,
     apply_auto_fills,
     row_to_list,
     validate_rows,
@@ -122,6 +123,73 @@ def list_csvs() -> list[str]:
     return sorted(SCHEMAS.keys())
 
 
+def _unwrap_rows_param(rows: Any) -> list[dict[str, Any]]:
+    """Normalize the `rows` argument from a model into `list[dict]`.
+
+    The pm agent has a known schema-amnesia pattern: after several turns
+    of conversation it sometimes emits `rows={"item": {...}}` (a dict
+    with key "item") or `rows={...}` (a single dict) instead of the
+    expected `rows=[{...}]` (a list with one dict). This is a model-side
+    wrap-object hallucination that pydantic would otherwise reject with
+    "Input should be a valid list".
+
+    This helper is the server-side defense: it accepts the common wrong
+    shapes and silently unwraps them, so the agent's call still succeeds.
+    Logged so we can see when the model is misbehaving.
+
+    Accepts:
+        - `[{...}, {...}]` (the happy path)
+        - `{"item": {...}}` → `[<item>]` (the wrap hallucination)
+        - `{"item": [{...}, {...}]}` → `[<items>]`
+        - `{...}` (a single dict, no "item" key) → `[<dict>]`
+
+    Rejects:
+        - Anything that doesn't fit the above patterns (empty list is
+          fine; the upstream `validate_rows` checks emptiness downstream).
+    """
+    if isinstance(rows, list):
+        return rows
+
+    if isinstance(rows, dict):
+        # The two known hallucination shapes.
+        if "item" in rows and isinstance(rows["item"], (dict, list)):
+            inner = rows["item"]
+            if isinstance(inner, dict):
+                _log.info(
+                    "unwrap_rows_param",
+                    reason="item_wrapper_single",
+                    count=1,
+                )
+                return [inner]
+            # inner is a list
+            _log.info(
+                "unwrap_rows_param",
+                reason="item_wrapper_list",
+                count=len(inner),
+            )
+            return inner
+
+        # Single-dict hallucination: no "item" key, but the whole thing is
+        # a row. Heuristic: it's a flat dict (no nested dicts/lists of
+        # rows) — the row schema columns.
+        if all(isinstance(v, (str, type(None))) for v in rows.values()):
+            _log.info(
+                "unwrap_rows_param",
+                reason="single_dict",
+                count=1,
+            )
+            return [rows]
+
+        raise PMCError(
+            f"cannot unwrap rows: got dict but no 'item' key and values "
+            f"don't look like a flat row: keys={list(rows.keys())[:5]}"
+        )
+
+    raise PMCError(
+        f"cannot unwrap rows: expected list or dict, got {type(rows).__name__}"
+    )
+
+
 @mcp.tool()
 @_envelope("get_schema")
 def get_schema(csv_name: str) -> dict[str, Any]:
@@ -145,37 +213,60 @@ def get_schema(csv_name: str) -> dict[str, Any]:
 
 @mcp.tool()
 @_envelope("read_csv")
-def read_csv(csv_name: str, max_rows: int = 1000) -> list[dict[str, str]]:
-    """Read all rows from a CSV. Header row (row 1) is excluded."""
+def read_csv(csv_name: str, max_rows: int = 1000, days: int = 30) -> list[dict[str, str]]:
+    """Read all rows from a CSV. Header row (row 1) is excluded.
+
+    For maintenance/events: filtered to last `days` days (0 = all time).
+    For tenants/properties/vendors: `days` is ignored (always read everything).
+    """
     folder_id = _get_folder_id()
     sheet_id = resolve_sheet_id(folder_id, csv_name, filename_override=_get_filename_override(csv_name))
     rows = read_sheet(sheet_id, csv_name, max_rows=max_rows)
-    _log.info("read_csv", csv=csv_name, rows=len(rows))
+    schema = _get_schema_obj(csv_name)
+    today = date.today()
+    rows = [r for r in rows if _within_entry_date(r, schema, days, today)]
+    _log.info("read_csv", csv=csv_name, days=days, rows=len(rows))
     return rows
 
 
 @mcp.tool()
 @_envelope("read_csv_rows")
-def read_csv_rows(csv_name: str, filters: dict[str, Any]) -> list[dict[str, str]]:
-    """Read rows from a CSV matching all key=value filters (exact match)."""
+def read_csv_rows(
+    csv_name: str, filters: dict[str, Any], days: int = 30
+) -> list[dict[str, str]]:
+    """Read rows from a CSV matching all key=value filters (exact match).
+
+    For maintenance/events: also restricted to last `days` days.
+    For tenants/properties/vendors: `days` is ignored.
+    """
     folder_id = _get_folder_id()
     sheet_id = resolve_sheet_id(folder_id, csv_name, filename_override=_get_filename_override(csv_name))
     rows = read_sheet(sheet_id, csv_name)
-    matched = [r for r in rows if _matches_filters(r, filters)]
-    _log.info("read_csv_rows", csv=csv_name, filters=filters, matched=len(matched))
+    schema = _get_schema_obj(csv_name)
+    today = date.today()
+    matched = [
+        r
+        for r in rows
+        if _matches_filters(r, filters) and _within_entry_date(r, schema, days, today)
+    ]
+    _log.info("read_csv_rows", csv=csv_name, filters=filters, days=days, matched=len(matched))
     return matched
 
 
 @mcp.tool()
 @_envelope("count_csv_rows")
-def count_csv_rows(csv_name: str, filters: dict[str, Any] | None = None) -> int:
-    """Count rows, optionally filtered. Returns int."""
+def count_csv_rows(
+    csv_name: str, filters: dict[str, Any] | None = None, days: int = 30
+) -> int:
+    """Count rows, optionally filtered. For maintenance/events: also restricted to last `days` days."""
     folder_id = _get_folder_id()
     sheet_id = resolve_sheet_id(folder_id, csv_name, filename_override=_get_filename_override(csv_name))
     rows = read_sheet(sheet_id, csv_name)
+    schema = _get_schema_obj(csv_name)
+    today = date.today()
     if filters:
         rows = [r for r in rows if _matches_filters(r, filters)]
-    return len(rows)
+    return sum(1 for r in rows if _within_entry_date(r, schema, days, today))
 
 
 @mcp.tool()
@@ -183,6 +274,7 @@ def count_csv_rows(csv_name: str, filters: dict[str, Any] | None = None) -> int:
 def list_open_maintenance(
     owner: str | None = None,
     property: str | None = None,
+    days: int = 0,
 ) -> list[str]:
     """Return open maintenance items, grouped by owner with global numbering.
 
@@ -211,6 +303,8 @@ def list_open_maintenance(
     )
     rows = read_sheet(sheet_id, "maintenance")
 
+    today = date.today()
+
     # Pair each row with its 1-indexed Sheet row (header is row 1, data starts at 2)
     all_indexed = [(i, r) for i, r in enumerate(rows, start=2)]
     open_indexed = [(i, r) for i, r in all_indexed if r.get("status", "").strip().lower() == "open"]
@@ -226,8 +320,13 @@ def list_open_maintenance(
             for i, r in open_indexed
             if r.get("property", "").strip() == property.strip()
         ]
-
-    today = date.today()
+    # Date filter — default 0 (no filter) since list_open_maintenance is exhaustive
+    # For "recent only" views, use read_csv_rows("maintenance", filters={"status":"open"}, days=N)
+    if days > 0:
+        maintenance_schema = _get_schema_obj("maintenance")
+        open_indexed = [
+            (i, r) for i, r in open_indexed if _within_entry_date(r, maintenance_schema, days, today)
+        ]
 
     def _days(start: str) -> int:
         try:
@@ -249,7 +348,13 @@ def list_open_maintenance(
         issue = r.get("issue", "")
         start = r.get("start_date", "")
         days = _days(start)
-        age_marker = "today" if days == 0 and start else f"{days}d"
+        if days == 0 and start:
+            age_marker = "today"
+        elif days < 0:
+            # Future-dated event: "in 3d" instead of the misleading "-3d"
+            age_marker = f"in {-days}d"
+        else:
+            age_marker = f"{days}d"
         unit_str = f", {unit}" if unit else ""
         return f"{n}. {prop}{unit_str} — {issue} ({age_marker}, row={sheet_row})"
 
@@ -259,9 +364,11 @@ def list_open_maintenance(
     for n, (sheet_row, r) in enumerate(open_indexed, start=1):
         owner_v = r.get("owner", "?")
         if owner_v != current_owner:
+            if current_owner is not None:
+                lines.append("")  # blank line between owner groups
             current_owner = owner_v
-            lines.append(f"{owner_v}:")
-        lines.append(_format_item(n, sheet_row, r))
+            lines.append(f"{owner_v.upper()}:")
+        lines.append(f"  {_format_item(n, sheet_row, r)}")
         if r.get("start_date", "") == today.strftime("%Y-%m-%d"):
             today_numbers.append(n)
 
@@ -285,11 +392,59 @@ def list_open_maintenance(
 
 @mcp.tool()
 @_envelope("append_rows")
-def append_rows(csv_name: str, rows: list[dict[str, Any]]) -> list[int]:
+def append_rows(
+    csv_name: str, rows: list[dict[str, Any]] | dict[str, Any]
+) -> list[int]:
     """Append one or more rows. Returns the row indices (1-indexed) of appended rows.
 
     Auto-fills `created_at` on maintenance. Validates headers, enums, and dates.
+
+    **Even for a single row, `rows` MUST be a list of length 1, e.g.
+    `rows=[{...}]`. A single-row append is not a single dict — it is a
+    list of one item.** This framing is what the rest of the codebase
+    assumes; sending a single dict (or `{"item": {...}}`) will fail with
+    "Input should be a valid list".
+
+    The `rows` parameter is a LIST of dicts — one dict per row to append.
+    Use this exact shape:
+
+        mcp_pm_manage_csvs_append_rows(
+            csv_name="maintenance",
+            rows=[
+                {
+                    "property": "2755 Oakmont",
+                    "unit": "A2",
+                    "owner": "sharon",
+                    "start_date": "2026-09-11",
+                    "end_date": "",
+                    "issue": "Insurance inspection 9:30am",
+                    "status": "open",
+                    "notes": "",
+                }
+            ]
+        )
+
+    The above call appends a single row (a "list of one") at the next
+    free row in the maintenance sheet. To append multiple rows, add
+    more dicts to the list — same shape, same tool.
+
+    **Server-side defensive unwrapping.** The pm agent has a known
+    schema-amnesia pattern where after many turns of conversation it
+    emits `rows={"item": {...}}` (a dict with key "item") or
+    `rows={...}` (a single dict) instead of the expected list shape.
+    These common wrap-pattern hallucinations are silently unwrapped
+    server-side — the call still succeeds, and the unwrap is logged
+    so we can see when the model is misbehaving.
+
+    Common mistake: a single-row append (a "list of one") looks like
+    `rows=[{...}]` (a list with one dict), NOT `rows={...}` (a single
+    dict) and NOT `rows={"item": {...}}` (a dict with key "item").
+    The latter two are tolerated but should be considered a bug in
+    the calling agent — they're unwrapped automatically.
+    Call `mcp_pm_manage_csvs_get_schema(csv_name="maintenance")` first
+    if you're unsure of the column names — never guess.
     """
+    rows = _unwrap_rows_param(rows)
     validate_rows(csv_name, rows)
     rows = apply_auto_fills(csv_name, rows, is_update=False)
     schema = _get_schema_obj(csv_name)
@@ -299,6 +454,15 @@ def append_rows(csv_name: str, rows: list[dict[str, Any]]) -> list[int]:
     sheet_id = resolve_sheet_id(folder_id, csv_name, filename_override=_get_filename_override(csv_name))
     indices = sheets_append_rows(sheet_id, csv_name, values)
     _log.info("append_rows", csv=csv_name, count=len(rows), indices=indices)
+    if len(rows) == 1:
+        # Grep-able breadcrumb so logs and human readers can tell
+        # single-row ("list of one") from multi-row at a glance.
+        _log.info(
+            "append_rows_single",
+            csv=csv_name,
+            index=indices[0],
+            framed_as="list_of_one",
+        )
     return indices
 
 
@@ -331,26 +495,27 @@ def update_row(csv_name: str, row_index: int, values: dict[str, str]) -> dict[st
     return {"ok": True, "row": row_index, "updated_fields": sorted(coerced.keys())}
 
 
-@mcp.tool()
+@mcp.tool(name="bulk_update_rows")
 @_envelope("update_rows")
 def update_rows(
     csv_name: str,
     row_indices: list[int],
     values: dict[str, str],
 ) -> dict[str, Any]:
-    """Apply the same `values` to multiple rows in one Sheets API call.
+    """Bulk update — apply the same `values` to multiple rows in one Sheets API call.
 
-    Token-efficient bulk update: 1 tool call instead of N. Use when you need
-    to update several rows with the same field values (e.g. "mark all chris's
-    open tasks as done").
+    SCHEMA (multi-row):
+        csv_name   (str):       target sheet (e.g. "maintenance")
+        row_indices (list[int]): 1-indexed Sheet row numbers, e.g. [3, 5, 7]
+        values     (dict[str,str]): field→value map applied to ALL rows, e.g. {"status": "done"}
+
+    Use this when the SAME change applies to N rows (e.g. "mark #2, #4, #7 done").
+    Token-efficient: 1 tool call instead of N. Same shape on every row.
+
+    For ONE row only, use `update_row(row_index=int)` instead.
 
     Refuses to overwrite primary-key columns. Auto-fills `completed_at` on
     maintenance when status flips to 'done'.
-
-    Args:
-        csv_name: target sheet (e.g. "maintenance")
-        row_indices: 1-indexed Sheet row numbers, e.g. [3, 5, 7]
-        values: field→value map, e.g. {"status": "done"}
     """
     schema = _get_schema_obj(csv_name)
     if not row_indices:
